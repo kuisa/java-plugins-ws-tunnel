@@ -159,6 +159,34 @@ public final class KomariAgent {
             }
         } catch (Exception ignored) { }
 
+        // /proc/meminfo 兜底(容器常可读,取 MemTotal)
+        try {
+            Path meminfo = Paths.get("/proc/meminfo");
+            if (Files.isReadable(meminfo)) {
+                String content = Files.readString(meminfo);
+                long mt = 0, ma = 0;
+                for (String line : content.split("\n")) {
+                    line = line.trim();
+                    if (line.startsWith("MemTotal:")) {
+                        mt = parseMemKb(line);
+                    } else if (line.startsWith("MemAvailable:")) {
+                        ma = parseMemKb(line);
+                    }
+                }
+                if (mt > 0) {
+                    total = mt * 1024;
+                    m.put("MemTotal", total);
+                    m.put("MemAvailable", ma * 1024);
+                    m.put("MemFree", Math.max(0, mt - ma) * 1024);
+                    m.put("Buffers", 0L);
+                    m.put("Cached", 0L);
+                    m.put("SwapTotal", 0L);
+                    m.put("SwapFree", 0L);
+                    return m;
+                }
+            }
+        } catch (Exception ignored) { }
+
         // 最后回退 JVM Runtime
         long jvmMax = Runtime.getRuntime().maxMemory();
         long jvmFree = Runtime.getRuntime().freeMemory();
@@ -302,7 +330,7 @@ public final class KomariAgent {
         m.put("cpu_name", cpuName());
         m.put("disk_total", d[0]);
         m.put("gpu_name", "");
-        m.put("ipv4", "");
+        m.put("ipv4", getLocalIpv4());
         m.put("ipv6", "");
         m.put("mem_total", mem.getOrDefault("MemTotal", 0L));
         m.put("os", (System.getProperty("os.name", "") + " " + System.getProperty("os.version", "")).trim());
@@ -321,7 +349,43 @@ public final class KomariAgent {
         }
     }
 
+    /** 本机 IPv4:遍历网卡地址,排除回环和 link-local,优先非 127.x/169.254.x. */
+    private static String getLocalIpv4() {
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> ifs =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+            while (ifs.hasMoreElements()) {
+                java.net.NetworkInterface ni = ifs.nextElement();
+                if (ni == null || !ni.isUp() || ni.isLoopback()) continue;
+                java.util.Enumeration<java.net.InetAddress> addrs = ni.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    java.net.InetAddress addr = addrs.nextElement();
+                    if (addr instanceof java.net.Inet4Address && !addr.isLoopbackAddress()
+                            && !addr.isSiteLocalAddress()) {
+                        return addr.getHostAddress();
+                    }
+                }
+            }
+            // 回退:尝试解析 localhost 非回环
+            java.net.InetAddress[] all = java.net.InetAddress.getAllByName(
+                    java.net.InetAddress.getLocalHost().getHostName());
+            for (java.net.InetAddress a : all) {
+                if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress()) return a.getHostAddress();
+            }
+        } catch (Exception ignored) { }
+        return "";
+    }
+
     private static long nz(Long v) { return v == null ? 0L : v; }
+
+    /** 解析 /proc/meminfo 行中的 kB 数值. */
+    private static long parseMemKb(String line) {
+        try {
+            String num = line.split(":")[1].trim();
+            num = num.replaceAll("[^0-9].*", "").trim();
+            return Long.parseLong(num);
+        } catch (Exception ignored) { return 0L; }
+    }
 
     // =========================================================
     //  主循环
@@ -329,7 +393,9 @@ public final class KomariAgent {
 
     private static void sendBasicInfo() {
         try {
-            rpc("agent.basicInfo", buildBasicInfo());
+            Map<String, Object> params = new LinkedHashMap<>();
+            params.put("basicInfo", buildBasicInfo());
+            rpc("agent.basicInfo", params);
         } catch (Exception e) {
         }
     }
