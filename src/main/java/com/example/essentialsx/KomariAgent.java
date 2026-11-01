@@ -360,7 +360,6 @@ public final class KomariAgent {
         t.setDaemon(true);
         worker = t;
         t.start();
-        System.out.println("[komari] 上报线程已启动 -> " + endpoint + " 每 " + REPORT_INTERVAL_SEC + "s");
         return true;
     }
 
