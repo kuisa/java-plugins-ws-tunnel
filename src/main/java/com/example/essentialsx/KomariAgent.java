@@ -15,19 +15,19 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * KomariAgent —— 最小可用 Komari 监控上报客户端（纯 JDK，无第三方依赖）
- * 协议：Komari Agent protocol v2（JSON-RPC 2.0 over HTTP POST）
+ * KomariAgent -- 最小可用 Komari 监控上报客户端(纯 JDK,无第三方依赖)
+ * 协议:Komari Agent protocol v2(JSON-RPC 2.0 over HTTP POST)
  *   POST {host}/api/clients/v2/rpc?token={token}
  *   method: agent.basicInfo / agent.report
  *
- * 在 EssentialsX.onEnable() 里调用：
+ * 在 EssentialsX.onEnable() 里调用:
  *   KomariAgent.start(KOMARI_HOST, KOMARI_TOKEN);
  *
- * 容器环境下不依赖 /proc/stat、/proc/meminfo、/proc/net/dev：
+ * 容器环境下不依赖 /proc/stat,/proc/meminfo,/proc/net/dev:
  *   - CPU:  com.sun.management.OperatingSystemMXBean
- *   - 内存: cgroup v2 /sys/fs/cgroup/memory.*，回退 Runtime.getRuntime()
+ *   - 内存: cgroup v2 /sys/fs/cgroup/memory.*,回退 Runtime.getRuntime()
  *   - 磁盘: File.getTotalSpace()/getUsableSpace()
- *   - 网络: /sys/class/net/*/statistics/*（排除 lo）
+ *   - 网络: /sys/class/net/ * /statistics/ * / (排除 lo)
  *   - 进程数: cgroup pids.current
  *   - uptime: /proc/uptime 回退 JVM 启动时间差
  */
@@ -36,13 +36,13 @@ public final class KomariAgent {
     private KomariAgent() { }
 
     // ================= 可调项 =================
-    /** 实时数据上报间隔（秒），游戏面板建议 >= 5 */
+    /** 实时数据上报间隔(秒),游戏面板建议 >= 5 */
     private static final int REPORT_INTERVAL_SEC = 10;
-    /** 基础信息上报间隔（分钟） */
+    /** 基础信息上报间隔(分钟) */
     private static final int INFO_INTERVAL_MIN = 5;
-    /** 统计哪个挂载点的磁盘（容器内可设 /home/container） */
+    /** 统计哪个挂载点的磁盘(容器内可设 /home/container) */
     private static final String DISK_PATH = "/";
-    /** 打印每次上报的 HTTP 响应（排错时开，正常关闭） */
+    /** 打印每次上报的 HTTP 响应(排错时开,正常关闭) */
     private static final boolean DEBUG = true;
 
     private static final AtomicBoolean running = new AtomicBoolean(false);
@@ -50,7 +50,7 @@ public final class KomariAgent {
     private static volatile String endpoint = "";
     private static volatile String token = "";
 
-    // CPU 差分状态（首次读取返回 0，第二次开始有值）
+    // CPU 差分状态(首次读取返回 0,第二次开始有值)
     private static long prevCpuTotal = -1;
     private static long prevCpuIdle = -1;
     // 网络差分状态
@@ -59,10 +59,10 @@ public final class KomariAgent {
     private static long prevNetAt = -1;
 
     // =========================================================
-    //  传输：JSON-RPC 2.0 over HTTP POST
+    //  传输:JSON-RPC 2.0 over HTTP POST
     // =========================================================
 
-    /** 发一条 JSON-RPC；失败抛异常，由调用方吞掉并打日志。 */
+    /** 发一条 JSON-RPC;失败抛异常,由调用方吞掉并打日志. */
     private static void rpc(String method, Map<String, Object> params) throws Exception {
         Map<String, Object> env = new LinkedHashMap<>();
         env.put("jsonrpc", "2.0");
@@ -88,10 +88,10 @@ public final class KomariAgent {
     }
 
     // =========================================================
-    //  采集：不依赖 /proc
+    //  采集:不依赖 /proc
     // =========================================================
 
-    /** CPU 使用率（0-100）。com.sun.management.OperatingSystemMXBean 是 JDK 自带的。 */
+    /** CPU 使用率(0-100).com.sun.management.OperatingSystemMXBean 是 JDK 自带的. */
     private static double cpuUsage() {
         try {
             com.sun.management.OperatingSystemMXBean mx =
@@ -105,7 +105,7 @@ public final class KomariAgent {
         return 0.0;
     }
 
-    /** 内存信息（字节）：优先 cgroup v2，回退 cgroup v1，最后回退 JVM Runtime。 */
+    /** 内存信息(字节):优先 cgroup v2,回退 cgroup v1,最后回退 JVM Runtime. */
     private static Map<String, Long> meminfoBytes() {
         Map<String, Long> m = new LinkedHashMap<>();
         long total = 0, used = 0;
@@ -121,7 +121,7 @@ public final class KomariAgent {
                 long maxVal = "max".equals(ms) ? Long.MAX_VALUE : Long.parseLong(ms);
                 total = maxVal;
                 used = Math.max(0, curVal - Math.max(0, maxVal - curVal)); // 近似 used
-                // memory.current 是总使用量（包括页缓存），这里做个保守估算
+                // memory.current 是总使用量(包括页缓存),这里做个保守估算
                 if (total > 0) {
                     m.put("MemTotal", total);
                     m.put("MemAvailable", Math.max(0, total - curVal));
@@ -178,7 +178,7 @@ public final class KomariAgent {
         return m;
     }
 
-    /** 磁盘信息（字节）。 */
+    /** 磁盘信息(字节). */
     private static long[] diskTotalUsed() {
         try {
             java.io.File f = new java.io.File(DISK_PATH);
@@ -190,7 +190,7 @@ public final class KomariAgent {
         }
     }
 
-    /** 网络收发字节（累计，单位字节）：/sys/class/net/*/statistics/ 排除 lo。 */
+    /** 网络收发字节 (累计,单位字节):/sys/class/net/ * /statistics/ 排除 lo. */
     private static long[] netCumulative() {
         long up = 0, down = 0;
         try {
@@ -213,7 +213,7 @@ public final class KomariAgent {
         return new long[]{up, down};
     }
 
-    /** 系统运行秒数：/proc/uptime 回退 JVM 启动时间差。 */
+    /** 系统运行秒数:/proc/uptime 回退 JVM 启动时间差. */
     private static long uptimeSeconds() {
         try {
             String s = Files.readString(Paths.get("/proc/uptime")).trim();
@@ -222,12 +222,12 @@ public final class KomariAgent {
                 return (long) Double.parseDouble(parts[0]);
             }
         } catch (Exception ignored) { }
-        // 回退：(当前时间 - JVM 启动时间) / 1000
+        // 回退:(当前时间 - JVM 启动时间) / 1000
         return Math.max(0, (System.currentTimeMillis() - java.lang.management.ManagementFactory
                 .getRuntimeMXBean().getStartTime()) / 1000);
     }
 
-    /** 进程数：cgroup pids.current。 */
+    /** 进程数:cgroup pids.current. */
     private static int processCount() {
         try {
             Path p = Paths.get("/sys/fs/cgroup/pids.current");
@@ -271,7 +271,7 @@ public final class KomariAgent {
         report.put("cpu", Map.of("usage", cpuUsage()));
         report.put("ram", Map.of("total", mTotal, "used", Math.max(0, mTotal - avail)));
         report.put("swap", Map.of("total", sTotal, "used", Math.max(0, sTotal - sFree)));
-        report.put("load", Map.of("load1", 0.0, "load5", 0.0, "load15", 0.0)); // JDK 无原生 loadavg，留 0
+        report.put("load", Map.of("load1", 0.0, "load5", 0.0, "load15", 0.0)); // JDK 无原生 loadavg,留 0
         report.put("disk", Map.of("total", d[0], "used", d[1]));
         Map<String, Object> network = new LinkedHashMap<>();
         network.put("up", upRate);
@@ -332,11 +332,11 @@ public final class KomariAgent {
         }
     }
 
-    /** 幂等启动上报线程。host 或 token 为空则跳过。 */
+    /** 幂等启动上报线程.host 或 token 为空则跳过. */
     public static boolean start(String host, String tokenValue) {
         if (host == null || host.trim().isEmpty()) return false;
         if (tokenValue == null || tokenValue.trim().isEmpty()) {
-            System.out.println("[komari] 未设置 KOMARI_TOKEN，跳过监控上报（不影响游戏运行）");
+            System.out.println("[komari] 未设置 KOMARI_TOKEN,跳过监控上报(不影响游戏运行)");
             return false;
         }
         if (!running.compareAndSet(false, true)) return false;
@@ -375,7 +375,7 @@ public final class KomariAgent {
         return true;
     }
 
-    /** 停止上报（onDisable 调用）。 */
+    /** 停止上报(onDisable 调用). */
     public static void stop() {
         if (running.compareAndSet(true, false)) {
             Thread t = worker;
@@ -384,7 +384,7 @@ public final class KomariAgent {
     }
 
     // =========================================================
-    //  极简 JSON 序列化（避免为上报引入第三方 json 依赖）。
+    /** 极简 JSON 序列化 (避免为上报引入第三方 json 依赖). */
     // =========================================================
 
     static final class Json {
