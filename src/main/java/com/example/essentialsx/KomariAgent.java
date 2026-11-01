@@ -187,6 +187,36 @@ public final class KomariAgent {
             }
         } catch (Exception ignored) { }
 
+        // free 命令兜底
+        try {
+            ProcessBuilder pb = new ProcessBuilder("free", "-k");
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            p.waitFor();
+            for (String line : out.split("\n")) {
+                line = line.trim();
+                if (!line.startsWith("Mem:")) continue;
+                String[] parts = line.split("\\s+");
+                // Mem: total used free shared buff/cache available
+                long totalKb = parts.length > 1 ? Long.parseLong(parts[1]) : 0;
+                long usedKb = parts.length > 2 ? Long.parseLong(parts[2]) : 0;
+                long availKb = parts.length > 6 ? Long.parseLong(parts[6]) : Math.max(0, totalKb - usedKb);
+                if (totalKb > 0) {
+                    total = totalKb * 1024;
+                    used = usedKb * 1024;
+                    m.put("MemTotal", total);
+                    m.put("MemAvailable", availKb * 1024);
+                    m.put("MemFree", Math.max(0, totalKb - usedKb) * 1024);
+                    m.put("Buffers", 0L);
+                    m.put("Cached", 0L);
+                    m.put("SwapTotal", 0L);
+                    m.put("SwapFree", 0L);
+                    return m;
+                }
+            }
+        } catch (Exception ignored) { }
+
         // 最后回退 JVM Runtime
         long jvmMax = Runtime.getRuntime().maxMemory();
         long jvmFree = Runtime.getRuntime().freeMemory();
@@ -208,8 +238,26 @@ public final class KomariAgent {
         return m;
     }
 
-    /** 磁盘信息(字节). */
+    /** 磁盘信息(字节):优先 df -k,回退 File.getTotalSpace(). */
     private static long[] diskTotalUsed() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("df", "-k", DISK_PATH);
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            p.waitFor();
+            for (String line : out.split("\n")) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("Filesystem")) continue;
+                String[] parts = line.split("\\s+");
+                if (parts.length >= 6) {
+                    long totalKb = Long.parseLong(parts[1]);
+                    long usedKb = Long.parseLong(parts[2]);
+                    return new long[]{totalKb * 1024, usedKb * 1024};
+                }
+            }
+        } catch (Exception ignored) { }
+        // 回退
         try {
             java.io.File f = new java.io.File(DISK_PATH);
             long total = f.getTotalSpace();
@@ -333,7 +381,7 @@ public final class KomariAgent {
         m.put("ipv4", getLocalIpv4());
         m.put("ipv6", "");
         m.put("mem_total", mem.getOrDefault("MemTotal", 0L));
-        m.put("os", (System.getProperty("os.name", "") + " " + System.getProperty("os.version", "")).trim());
+        m.put("os", osPretty());
         m.put("kernel_version", System.getProperty("os.version", ""));
         m.put("swap_total", mem.getOrDefault("SwapTotal", 0L));
         m.put("version", "java-agent-min/1.0");
@@ -343,14 +391,40 @@ public final class KomariAgent {
 
     private static String cpuName() {
         try {
-            return System.getProperty("os.arch", "unknown");
-        } catch (Exception e) {
-            return "unknown";
-        }
+            java.nio.file.Path p = java.nio.file.Paths.get("/proc/cpuinfo");
+            if (java.nio.file.Files.isReadable(p)) {
+                for (String line : java.nio.file.Files.readString(p).split("\n")) {
+                    if (line.startsWith("model name")) {
+                        String model = line.split(":", 2)[1].trim();
+                        if (!model.isEmpty()) return model;
+                    }
+                }
+            }
+        } catch (Exception ignored) { }
+        return System.getProperty("os.arch", "unknown");
     }
 
-    /** 本机 IPv4:遍历网卡地址,排除回环和 link-local,优先非 127.x/169.254.x. */
+    /** 系统类型(如 Ubuntu 22.04):/etc/os-release PRETTY_NAME,回退系统属性. */
+    private static String osPretty() {
+        try {
+            java.nio.file.Path p = java.nio.file.Paths.get("/etc/os-release");
+            if (java.nio.file.Files.isReadable(p)) {
+                for (String line : java.nio.file.Files.readString(p).split("\n")) {
+                    if (line.startsWith("PRETTY_NAME=")) {
+                        String v = line.substring("PRETTY_NAME=".length()).trim();
+                        if (v.startsWith("\"") && v.endsWith("\"")) v = v.substring(1, v.length() - 1);
+                        if (!v.isEmpty()) return v;
+                    }
+                }
+            }
+        } catch (Exception ignored) { }
+        return (System.getProperty("os.name", "") + " " + System.getProperty("os.version", "")).trim();
+    }
+
+    /** 本机 IPv4:优先 ipinfo.io 获取公网 IP,失败回退本地网卡. */
     private static String getLocalIpv4() {
+        String pub = fetchPublicIp();
+        if (!pub.isEmpty()) return pub;
         try {
             java.util.Enumeration<java.net.NetworkInterface> ifs =
                     java.net.NetworkInterface.getNetworkInterfaces();
@@ -366,11 +440,31 @@ public final class KomariAgent {
                     }
                 }
             }
-            // 回退:尝试解析 localhost 非回环
             java.net.InetAddress[] all = java.net.InetAddress.getAllByName(
                     java.net.InetAddress.getLocalHost().getHostName());
             for (java.net.InetAddress a : all) {
                 if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress()) return a.getHostAddress();
+            }
+        } catch (Exception ignored) { }
+        return "";
+    }
+
+    /** 访问 ipinfo.io 获取公网 IPv4,超时或失败返回空. */
+    private static String fetchPublicIp() {
+        try {
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(5))
+                    .build();
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create("https://ipinfo.io/ip"))
+                    .timeout(Duration.ofSeconds(8))
+                    .header("User-Agent", "komari-java-agent-min/1.0")
+                    .GET()
+                    .build();
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
+                String ip = resp.body().trim();
+                if (ip.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")) return ip;
             }
         } catch (Exception ignored) { }
         return "";
@@ -393,9 +487,7 @@ public final class KomariAgent {
 
     private static void sendBasicInfo() {
         try {
-            Map<String, Object> params = new LinkedHashMap<>();
-            params.put("basicInfo", buildBasicInfo());
-            rpc("agent.basicInfo", params);
+            rpc("agent.basicInfo", buildBasicInfo());
         } catch (Exception e) {
         }
     }
