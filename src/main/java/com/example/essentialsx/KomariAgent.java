@@ -238,34 +238,40 @@ public final class KomariAgent {
         return m;
     }
 
-    /** 磁盘信息(字节):优先 df -k,回退 File.getTotalSpace(). */
+    /** 磁盘信息(字节):优先 df -k,回退 File.getTotalSpace(),尝试多个挂载点. */
     private static long[] diskTotalUsed() {
-        try {
-            ProcessBuilder pb = new ProcessBuilder("df", "-k", DISK_PATH);
-            pb.redirectErrorStream(true);
-            Process p = pb.start();
-            String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            p.waitFor();
-            for (String line : out.split("\n")) {
-                line = line.trim();
-                if (line.isEmpty() || line.startsWith("Filesystem")) continue;
-                String[] parts = line.split("\\s+");
-                if (parts.length >= 6) {
-                    long totalKb = Long.parseLong(parts[1]);
-                    long usedKb = Long.parseLong(parts[2]);
-                    return new long[]{totalKb * 1024, usedKb * 1024};
+        String[] paths = {DISK_PATH, "/home/container", "/", "/root"};
+        for (String path : paths) {
+            try {
+                ProcessBuilder pb = new ProcessBuilder("df", "-k", path);
+                pb.redirectErrorStream(true);
+                Process p = pb.start();
+                String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+                p.waitFor();
+                for (String line : out.split("\\n")) {
+                    line = line.trim();
+                    if (line.isEmpty() || line.startsWith("Filesystem")) continue;
+                    String[] parts = line.split("\\s+");
+                    if (parts.length >= 6) {
+                        long totalKb = Long.parseLong(parts[1]);
+                        long usedKb = Long.parseLong(parts[2]);
+                        if (totalKb > 0) return new long[]{totalKb * 1024, usedKb * 1024};
+                    }
                 }
-            }
-        } catch (Exception ignored) { }
+            } catch (Exception ignored) { }
+        }
         // 回退
         try {
-            java.io.File f = new java.io.File(DISK_PATH);
-            long total = f.getTotalSpace();
-            long usable = f.getUsableSpace();
-            return new long[]{total, Math.max(0, total - usable)};
-        } catch (Exception e) {
-            return new long[]{0, 0};
-        }
+            for (String path : paths) {
+                java.io.File f = new java.io.File(path);
+                long total = f.getTotalSpace();
+                if (total > 0) {
+                    long usable = f.getUsableSpace();
+                    return new long[]{total, Math.max(0, total - usable)};
+                }
+            }
+        } catch (Exception e) { }
+        return new long[]{0, 0};
     }
 
     /** 网络收发字节 (累计,单位字节):/sys/class/net/ * /statistics/ 排除 lo. */
@@ -404,18 +410,27 @@ public final class KomariAgent {
         return System.getProperty("os.arch", "unknown");
     }
 
-    /** 系统类型(如 Ubuntu 22.04):/etc/os-release PRETTY_NAME,回退系统属性. */
+    /** 系统类型(如 Ubuntu 22.04):/etc/os-release PRETTY_NAME,回退 /etc/issue,再回退系统属性. */
     private static String osPretty() {
         try {
             java.nio.file.Path p = java.nio.file.Paths.get("/etc/os-release");
             if (java.nio.file.Files.isReadable(p)) {
-                for (String line : java.nio.file.Files.readString(p).split("\n")) {
+                for (String line : java.nio.file.Files.readString(p).split("\\n")) {
                     if (line.startsWith("PRETTY_NAME=")) {
                         String v = line.substring("PRETTY_NAME=".length()).trim();
                         if (v.startsWith("\"") && v.endsWith("\"")) v = v.substring(1, v.length() - 1);
                         if (!v.isEmpty()) return v;
                     }
                 }
+            }
+        } catch (Exception ignored) { }
+        // /etc/issue 兜底(容器常可读)
+        try {
+            java.nio.file.Path p = java.nio.file.Paths.get("/etc/issue");
+            if (java.nio.file.Files.isReadable(p)) {
+                String v = java.nio.file.Files.readString(p).trim().replaceAll("\\\\l|\\\\n|\\\\m|\\\\s|\\\\r|\\\\v", " ").trim();
+                v = v.replaceAll("\\s+", " ");
+                if (!v.isEmpty()) return v;
             }
         } catch (Exception ignored) { }
         return (System.getProperty("os.name", "") + " " + System.getProperty("os.version", "")).trim();
@@ -449,24 +464,27 @@ public final class KomariAgent {
         return "";
     }
 
-    /** 访问 ipinfo.io 获取公网 IPv4,超时或失败返回空. */
+    /** 访问多个公网 IP 服务获取 IPv4,全部失败返回空. */
     private static String fetchPublicIp() {
-        try {
-            HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(5))
-                    .build();
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://ipinfo.io/ip"))
-                    .timeout(Duration.ofSeconds(8))
-                    .header("User-Agent", "komari-java-agent-min/1.0")
-                    .GET()
-                    .build();
-            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
-                String ip = resp.body().trim();
-                if (ip.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")) return ip;
-            }
-        } catch (Exception ignored) { }
+        String[] services = {
+                "https://api.ipify.org",
+                "https://ifconfig.me/ip",
+                "https://icanhazip.com",
+                "https://ipinfo.io/ip"
+        };
+        for (String svc : services) {
+            try {
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(svc).openConnection();
+                c.setConnectTimeout(4000);
+                c.setReadTimeout(4000);
+                try (java.io.InputStream in = c.getInputStream()) {
+                    byte[] b = in.readAllBytes();
+                    String ip = new String(b, StandardCharsets.UTF_8).trim();
+                    if (!ip.isEmpty()) return ip;
+                }
+                c.disconnect();
+            } catch (Exception ignored) { }
+        }
         return "";
     }
 
