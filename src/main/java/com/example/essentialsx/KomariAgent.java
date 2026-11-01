@@ -1,23 +1,18 @@
 package com.example.essentialsx;
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.lang.management.ManagementFactory;
-import java.lang.management.MemoryMXBean;
-import java.lang.management.MemoryUsage;
 
 /**
  * KomariAgent —— 最小可用 Komari 监控上报客户端（纯 JDK，无第三方依赖）
@@ -28,7 +23,13 @@ import java.lang.management.MemoryUsage;
  * 在 EssentialsX.onEnable() 里调用：
  *   KomariAgent.start(KOMARI_HOST, KOMARI_TOKEN);
  *
- * 容器环境下 /proc 可能受限，读不到时会打印具体原因到控制台，并用 JVM 兜底。
+ * 容器环境下不依赖 /proc/stat、/proc/meminfo、/proc/net/dev：
+ *   - CPU:  com.sun.management.OperatingSystemMXBean
+ *   - 内存: cgroup v2 /sys/fs/cgroup/memory.*，回退 Runtime.getRuntime()
+ *   - 磁盘: File.getTotalSpace()/getUsableSpace()
+ *   - 网络: /sys/class/net/*/statistics/*（排除 lo）
+ *   - 进程数: cgroup pids.current
+ *   - uptime: /proc/uptime 回退 JVM 启动时间差
  */
 public final class KomariAgent {
 
@@ -36,18 +37,26 @@ public final class KomariAgent {
 
     // ================= 可调项 =================
     /** 实时数据上报间隔（秒），游戏面板建议 >= 5 */
-    private static final int  REPORT_INTERVAL_SEC = 10;
+    private static final int REPORT_INTERVAL_SEC = 10;
     /** 基础信息上报间隔（分钟） */
-    private static final int  INFO_INTERVAL_MIN   = 5;
+    private static final int INFO_INTERVAL_MIN = 5;
     /** 统计哪个挂载点的磁盘（容器内可设 /home/container） */
-    private static final String DISK_PATH         = "/";
+    private static final String DISK_PATH = "/";
     /** 打印每次上报的 HTTP 响应（排错时开，正常关闭） */
-    private static final boolean DEBUG            = true;
+    private static final boolean DEBUG = true;
 
     private static final AtomicBoolean running = new AtomicBoolean(false);
     private static volatile Thread worker = null;
     private static volatile String endpoint = "";
     private static volatile String token = "";
+
+    // CPU 差分状态（首次读取返回 0，第二次开始有值）
+    private static long prevCpuTotal = -1;
+    private static long prevCpuIdle = -1;
+    // 网络差分状态
+    private static long prevNetUp = -1;
+    private static long prevNetDown = -1;
+    private static long prevNetAt = -1;
 
     // =========================================================
     //  传输：JSON-RPC 2.0 over HTTP POST
@@ -66,169 +75,167 @@ public final class KomariAgent {
                 .build();
         HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create(endpoint + "/api/clients/v2/rpc?token="
-                        + java.net.URLEncoder.encode(token, StandardCharsets.UTF_8)))
+                        + URLEncoder.encode(token, StandardCharsets.UTF_8)))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "komari-java-agent-min/1.0")
                 .POST(HttpRequest.BodyPublishers.ofString(Json.toJson(env), StandardCharsets.UTF_8))
                 .build();
         HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
-        if (DEBUG) {
-            String body = resp.body();
-            if (body != null && body.length() > 500) body = body.substring(0, 500) + "...";
-            System.out.println("[komari] " + method + " -> HTTP " + resp.statusCode() + " " + body);
-        }
         if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
-            throw new Exception("Komari HTTP " + resp.statusCode() + ": " + resp.body());
+            throw new Exception("HTTP " + resp.statusCode() + ": " + resp.body());
         }
     }
 
     // =========================================================
-    //  采集（全部来自 /proc 与 JDK 自带 API，容器受限时兜底）
+    //  采集：不依赖 /proc
     // =========================================================
 
-    private static volatile long prevIdle = -1;
-    private static volatile long prevTotal = -1;
-    private static volatile long prevNetUp = -1;
-    private static volatile long prevNetDown = -1;
-    private static volatile long prevNetAt = 0;
-
-    private static List<String> readLines(String path) {
-        try {
-            return Files.readAllLines(Paths.get(path), StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            System.out.println("[komari] 读取失败: " + path + " -> " + e.getClass().getSimpleName() + ": " + e.getMessage());
-            return new ArrayList<>();
-        }
-    }
-
-    private static Map<String, Long> meminfoBytes() {
-        Map<String, Long> info = new LinkedHashMap<>();
-        List<String> lines = readLines("/proc/meminfo");
-        for (String line : lines) {
-            int i = line.indexOf(':');
-            if (i < 0) continue;
-            String rest = line.substring(i + 1).trim();
-            int sp = rest.indexOf(' ');
-            String num = sp < 0 ? rest : rest.substring(0, sp);
-            try {
-                info.put(line.substring(0, i), Long.parseLong(num) * 1024L);
-            } catch (NumberFormatException ignored) { }
-        }
-        return info;
-    }
-
-    /** /proc/stat 两次差分；取不到时回退 loadavg/核数。 */
+    /** CPU 使用率（0-100）。com.sun.management.OperatingSystemMXBean 是 JDK 自带的。 */
     private static double cpuUsage() {
         try {
-            List<String> lines = readLines("/proc/stat");
-            if (!lines.isEmpty()) {
-                String[] v = lines.get(0).trim().split("\\s+");
-                long idle = Long.parseLong(v[4]) + (v.length > 5 ? Long.parseLong(v[5]) : 0);
-                long total = 0;
-                for (int i = 1; i < v.length; i++) total += Long.parseLong(v[i]);
-                long pi = prevIdle, pt = prevTotal;
-                prevIdle = idle;
-                prevTotal = total;
-                if (pi >= 0 && total > pt) {
-                    double pct = 100.0 * (1.0 - (double) (idle - pi) / (double) (total - pt));
-                    return Math.round(pct * 100.0) / 100.0;
-                }
-                return 0.0;
+            com.sun.management.OperatingSystemMXBean mx =
+                    (com.sun.management.OperatingSystemMXBean)
+                            java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+            double load = mx.getSystemCpuLoad();
+            if (load >= 0.0 && load <= 1.0) {
+                return Math.round(load * 100.0 * 100.0) / 100.0;
             }
-        } catch (Exception ignored) { }
-        try {
-            double load = ManagementFactory.getOperatingSystemMXBean().getSystemLoadAverage();
-            int cores = Runtime.getRuntime().availableProcessors();
-            if (load >= 0 && cores > 0) return Math.round(Math.min(100.0, load / cores * 100) * 100.0) / 100.0;
         } catch (Exception ignored) { }
         return 0.0;
     }
 
-    private static long[] diskTotalUsed() {
+    /** 内存信息（字节）：优先 cgroup v2，回退 cgroup v1，最后回退 JVM Runtime。 */
+    private static Map<String, Long> meminfoBytes() {
+        Map<String, Long> m = new LinkedHashMap<>();
+        long total = 0, used = 0;
+
+        // cgroup v2
         try {
-            long total = new java.io.File(DISK_PATH).getTotalSpace();
-            long usable = new java.io.File(DISK_PATH).getUsableSpace();
-            if (total > 0) return new long[] { total, Math.max(0, total - usable) };
-        } catch (Exception ignored) { }
-        return new long[] { 0, 0 };
-    }
-
-    /** 累计上下行字节数（跳过 lo）。 */
-    private static long[] netCumulative() {
-        long up = 0, down = 0;
-        for (String line : readLines("/proc/net/dev")) {
-            int i = line.indexOf(':');
-            if (i < 0) continue;
-            if (line.substring(0, i).trim().equals("lo")) continue;
-            String[] p = line.substring(i + 1).trim().split("\\s+");
-            try {
-                down += Long.parseLong(p[0]);
-                up += Long.parseLong(p[8]);
-            } catch (Exception ignored) { }
-        }
-        return new long[] { up, down };
-    }
-
-    private static int uptimeSeconds() {
-        try {
-            List<String> l = readLines("/proc/uptime");
-            if (!l.isEmpty()) return (int) Double.parseDouble(l.get(0).trim().split("\\s+")[0]);
-        } catch (Exception ignored) { }
-        return (int) (ManagementFactory.getRuntimeMXBean().getUptime() / 1000);
-    }
-
-    private static int processCount() {
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(Paths.get("/proc"))) {
-            int n = 0;
-            for (Path p : ds) {
-                String name = p.getFileName().toString();
-                if (name.isEmpty()) continue;
-                boolean digits = true;
-                for (int i = 0; i < name.length(); i++) {
-                    if (!Character.isDigit(name.charAt(i))) { digits = false; break; }
+            Path cur = Paths.get("/sys/fs/cgroup/memory.current");
+            Path max = Paths.get("/sys/fs/cgroup/memory.max");
+            if (Files.isReadable(cur) && Files.isReadable(max)) {
+                String cs = Files.readString(cur).trim();
+                String ms = Files.readString(max).trim();
+                long curVal = Long.parseLong(cs);
+                long maxVal = "max".equals(ms) ? Long.MAX_VALUE : Long.parseLong(ms);
+                total = maxVal;
+                used = Math.max(0, curVal - Math.max(0, maxVal - curVal)); // 近似 used
+                // memory.current 是总使用量（包括页缓存），这里做个保守估算
+                if (total > 0) {
+                    m.put("MemTotal", total);
+                    m.put("MemAvailable", Math.max(0, total - curVal));
+                    m.put("MemFree", 0L);
+                    m.put("Buffers", 0L);
+                    m.put("Cached", 0L);
+                    m.put("SwapTotal", 0L);
+                    m.put("SwapFree", 0L);
+                    return m;
                 }
-                if (digits) n++;
             }
-            return n;
-        } catch (Exception e) {
-            System.out.println("[komari] 读取 /proc 目录失败: " + e.getMessage());
-            return 0;
-        }
-    }
+        } catch (Exception ignored) { }
 
-    private static Map<String, Object> loadAvg() {
-        double l1 = 0, l5 = 0, l15 = 0;
-        for (String line : readLines("/proc/loadavg")) {
-            String[] a = line.trim().split("\\s+");
-            try {
-                l1 = Double.parseDouble(a[0]);
-                l5 = Double.parseDouble(a[1]);
-                l15 = Double.parseDouble(a[2]);
-            } catch (Exception ignored) { }
+        // cgroup v1
+        try {
+            Path limit = Paths.get("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+            Path usage = Paths.get("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+            if (Files.isReadable(limit) && Files.isReadable(usage)) {
+                long lim = Long.parseLong(Files.readString(limit).trim());
+                long use = Long.parseLong(Files.readString(usage).trim());
+                if (lim < Long.MAX_VALUE) {
+                    total = lim;
+                    used = use;
+                    m.put("MemTotal", total);
+                    m.put("MemAvailable", Math.max(0, total - use));
+                    m.put("MemFree", 0L);
+                    m.put("Buffers", 0L);
+                    m.put("Cached", 0L);
+                    m.put("SwapTotal", 0L);
+                    m.put("SwapFree", 0L);
+                    return m;
+                }
+            }
+        } catch (Exception ignored) { }
+
+        // 最后回退 JVM Runtime
+        long jvmMax = Runtime.getRuntime().maxMemory();
+        long jvmFree = Runtime.getRuntime().freeMemory();
+        long jvmTotal = Runtime.getRuntime().totalMemory();
+        if (jvmMax > 0) {
+            total = jvmMax;
+            used = jvmTotal - jvmFree;
+        } else {
+            total = jvmTotal;
+            used = Math.max(0, jvmTotal - jvmFree);
         }
-        if (l1 == 0 && l5 == 0 && l15 == 0) {
-            try {
-                double v = ManagementFactory.getOperatingSystemMXBean().getSystemLoadAverage();
-                if (v >= 0) l1 = v;
-            } catch (Exception ignored) { }
-        }
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("load1", round2(l1));
-        m.put("load5", round2(l5));
-        m.put("load15", round2(l15));
+        m.put("MemTotal", total);
+        m.put("MemAvailable", Math.max(0, total - used));
+        m.put("MemFree", Math.max(0, jvmFree));
+        m.put("Buffers", 0L);
+        m.put("Cached", 0L);
+        m.put("SwapTotal", 0L);
+        m.put("SwapFree", 0L);
         return m;
     }
 
-    private static String cpuName() {
-        for (String line : readLines("/proc/cpuinfo")) {
-            if (line.toLowerCase().startsWith("model name")) {
-                int i = line.indexOf(':');
-                if (i > 0) return line.substring(i + 1).trim();
-            }
+    /** 磁盘信息（字节）。 */
+    private static long[] diskTotalUsed() {
+        try {
+            java.io.File f = new java.io.File(DISK_PATH);
+            long total = f.getTotalSpace();
+            long usable = f.getUsableSpace();
+            return new long[]{total, Math.max(0, total - usable)};
+        } catch (Exception e) {
+            return new long[]{0, 0};
         }
-        String arch = System.getProperty("os.arch");
-        return (arch == null || arch.isEmpty()) ? "unknown" : arch;
+    }
+
+    /** 网络收发字节（累计，单位字节）：/sys/class/net/*/statistics/ 排除 lo。 */
+    private static long[] netCumulative() {
+        long up = 0, down = 0;
+        try {
+            Path dir = Paths.get("/sys/class/net");
+            if (Files.isDirectory(dir)) {
+                for (Path entry : Files.newDirectoryStream(dir)) {
+                    String name = entry.getFileName().toString();
+                    if ("lo".equals(name)) continue;
+                    Path rx = entry.resolve("statistics/rx_bytes");
+                    Path tx = entry.resolve("statistics/tx_bytes");
+                    if (Files.isReadable(rx) && Files.isReadable(tx)) {
+                        try {
+                            down += Long.parseLong(Files.readString(rx).trim());
+                            up += Long.parseLong(Files.readString(tx).trim());
+                        } catch (Exception ignored) { }
+                    }
+                }
+            }
+        } catch (Exception ignored) { }
+        return new long[]{up, down};
+    }
+
+    /** 系统运行秒数：/proc/uptime 回退 JVM 启动时间差。 */
+    private static long uptimeSeconds() {
+        try {
+            String s = Files.readString(Paths.get("/proc/uptime")).trim();
+            String[] parts = s.split("\\s+");
+            if (parts.length > 0) {
+                return (long) Double.parseDouble(parts[0]);
+            }
+        } catch (Exception ignored) { }
+        // 回退：(当前时间 - JVM 启动时间) / 1000
+        return Math.max(0, (System.currentTimeMillis() - java.lang.management.ManagementFactory
+                .getRuntimeMXBean().getStartTime()) / 1000);
+    }
+
+    /** 进程数：cgroup pids.current。 */
+    private static int processCount() {
+        try {
+            Path p = Paths.get("/sys/fs/cgroup/pids.current");
+            if (Files.isReadable(p)) {
+                return Integer.parseInt(Files.readString(p).trim());
+            }
+        } catch (Exception ignored) { }
+        return 0;
     }
 
     // =========================================================
@@ -250,26 +257,22 @@ public final class KomariAgent {
         }
 
         Map<String, Long> mem = meminfoBytes();
-        long mTotal = nz(mem.get("MemTotal"));
+        long mTotal = mem.getOrDefault("MemTotal", 0L);
         long avail = mem.containsKey("MemAvailable")
-                ? nz(mem.get("MemAvailable"))
-                : nz(mem.get("MemFree")) + nz(mem.get("Buffers")) + nz(mem.get("Cached"));
-        // 容器里 /proc/meminfo 读不到时，用 JVM Runtime 兜底
-        if (mTotal == 0) {
-            long jvmMax = Runtime.getRuntime().maxMemory();
-            if (jvmMax > 0) mTotal = jvmMax;
-            avail = jvmMax - Runtime.getRuntime().freeMemory();
-        }
-        long sTotal = nz(mem.get("SwapTotal"));
-        long sFree = nz(mem.get("SwapFree"));
+                ? mem.get("MemAvailable")
+                : mem.getOrDefault("MemFree", 0L)
+                + mem.getOrDefault("Buffers", 0L)
+                + mem.getOrDefault("Cached", 0L);
+        long sTotal = mem.getOrDefault("SwapTotal", 0L);
+        long sFree = mem.getOrDefault("SwapFree", 0L);
         long[] d = diskTotalUsed();
 
         Map<String, Object> report = new LinkedHashMap<>();
-        report.put("cpu", pair("usage", cpuUsage()));
-        report.put("ram", pair2("total", mTotal, "used", Math.max(0, mTotal - avail)));
-        report.put("swap", pair2("total", sTotal, "used", Math.max(0, sTotal - sFree)));
-        report.put("load", loadAvg());
-        report.put("disk", pair2("total", d[0], "used", d[1]));
+        report.put("cpu", Map.of("usage", cpuUsage()));
+        report.put("ram", Map.of("total", mTotal, "used", Math.max(0, mTotal - avail)));
+        report.put("swap", Map.of("total", sTotal, "used", Math.max(0, sTotal - sFree)));
+        report.put("load", Map.of("load1", 0.0, "load5", 0.0, "load15", 0.0)); // JDK 无原生 loadavg，留 0
+        report.put("disk", Map.of("total", d[0], "used", d[1]));
         Map<String, Object> network = new LinkedHashMap<>();
         network.put("up", upRate);
         network.put("down", downRate);
@@ -299,14 +302,24 @@ public final class KomariAgent {
         m.put("gpu_name", "");
         m.put("ipv4", "");
         m.put("ipv6", "");
-        m.put("mem_total", nz(mem.get("MemTotal")));
+        m.put("mem_total", mem.getOrDefault("MemTotal", 0L));
         m.put("os", (System.getProperty("os.name", "") + " " + System.getProperty("os.version", "")).trim());
         m.put("kernel_version", System.getProperty("os.version", ""));
-        m.put("swap_total", nz(mem.get("SwapTotal")));
+        m.put("swap_total", mem.getOrDefault("SwapTotal", 0L));
         m.put("version", "java-agent-min/1.0");
         m.put("virtualization", "container");
         return m;
     }
+
+    private static String cpuName() {
+        try {
+            return System.getProperty("os.arch", "unknown");
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
+
+    private static long nz(Long v) { return v == null ? 0L : v; }
 
     // =========================================================
     //  主循环
@@ -316,8 +329,6 @@ public final class KomariAgent {
         try {
             rpc("agent.basicInfo", buildBasicInfo());
         } catch (Exception e) {
-            System.out.println("[komari] basicInfo 失败: " + e);
-            if (DEBUG) e.printStackTrace(System.out);
         }
     }
 
@@ -345,8 +356,6 @@ public final class KomariAgent {
                     params.put("report", buildReport());
                     rpc("agent.report", params);
                 } catch (Exception e) {
-                    System.out.println("[komari] report 失败: " + e);
-                    if (DEBUG) e.printStackTrace(System.out);
                 }
                 if (System.currentTimeMillis() >= nextInfo) {
                     sendBasicInfo();
@@ -366,28 +375,18 @@ public final class KomariAgent {
         return true;
     }
 
-    // =========================================================
-    //  小工具
-    // =========================================================
-
-    private static long nz(Long v) { return v == null ? 0L : v; }
-
-    private static double round2(double v) { return Math.round(v * 100.0) / 100.0; }
-
-    private static Map<String, Object> pair(String k, Object v) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put(k, v);
-        return m;
+    /** 停止上报（onDisable 调用）。 */
+    public static void stop() {
+        if (running.compareAndSet(true, false)) {
+            Thread t = worker;
+            if (t != null) t.interrupt();
+        }
     }
 
-    private static Map<String, Object> pair2(String k1, Object v1, String k2, Object v2) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put(k1, v1);
-        m.put(k2, v2);
-        return m;
-    }
+    // =========================================================
+    //  极简 JSON 序列化（避免为上报引入第三方 json 依赖）。
+    // =========================================================
 
-    /** 极简 JSON 序列化（避免为上报引入第三方 json 依赖）。 */
     static final class Json {
         static String toJson(Object o) {
             StringBuilder sb = new StringBuilder();
@@ -418,15 +417,10 @@ public final class KomariAgent {
                     write(item, sb);
                 }
                 sb.append(']');
-            } else if (o instanceof String) {
-                escape((String) o, sb);
-            } else if (o instanceof Boolean || o instanceof Integer || o instanceof Long) {
-                sb.append(o.toString());
-            } else if (o instanceof Double || o instanceof Float) {
-                double d = ((Number) o).doubleValue();
-                sb.append(Double.isNaN(d) || Double.isInfinite(d) ? "0" : String.valueOf(d));
+            } else if (o instanceof Number || o instanceof Boolean) {
+                sb.append(o);
             } else {
-                escape(o.toString(), sb);
+                escape(String.valueOf(o), sb);
             }
         }
 
@@ -435,14 +429,19 @@ public final class KomariAgent {
             for (int i = 0; i < s.length(); i++) {
                 char c = s.charAt(i);
                 switch (c) {
-                    case '"':  sb.append("\\\""); break;
+                    case '"': sb.append("\\\""); break;
                     case '\\': sb.append("\\\\"); break;
-                    case '\n': sb.append("\\n");  break;
-                    case '\r': sb.append("\\r");  break;
-                    case '\t': sb.append("\\t");  break;
+                    case '\b': sb.append("\\b"); break;
+                    case '\f': sb.append("\\f"); break;
+                    case '\n': sb.append("\\n"); break;
+                    case '\r': sb.append("\\r"); break;
+                    case '\t': sb.append("\\t"); break;
                     default:
-                        if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
-                        else sb.append(c);
+                        if (c < 0x20) {
+                            sb.append(String.format("\\u%04x", (int) c));
+                        } else {
+                            sb.append(c);
+                        }
                 }
             }
             sb.append('"');
