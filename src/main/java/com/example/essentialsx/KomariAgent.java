@@ -16,10 +16,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
 
 /**
  * KomariAgent —— 最小可用 Komari 监控上报客户端（纯 JDK，无第三方依赖）
- * =====================================================================
  * 协议：Komari Agent protocol v2（JSON-RPC 2.0 over HTTP POST）
  *   POST {host}/api/clients/v2/rpc?token={token}
  *   method: agent.basicInfo / agent.report
@@ -27,19 +28,13 @@ import java.lang.management.ManagementFactory;
  * 在 EssentialsX.onEnable() 里调用：
  *   KomariAgent.start(KOMARI_HOST, KOMARI_TOKEN);
  *
- * 特性：
- *   - 只用 JDK 自带 API（java.net.http + /proc），不需要给 pom.xml 加任何依赖
- *   - 纯 daemon 线程，绝不阻塞主线程、绝不让服务器进程退出
- *   - 幂等：重复调用 start() 只起一个线程
- *   - host/token 任一为空则静默跳过（不影响游戏本体）
- *   - 所有异常都被吞掉，最多打一行日志
- *   - 容器内拿不到的指标（tcp/udp 连接数）留 0，不做虚假上报
+ * 容器环境下 /proc 可能受限，读不到时会打印具体原因到控制台，并用 JVM 兜底。
  */
 public final class KomariAgent {
 
     private KomariAgent() { }
 
-    // ================= 可调项（不想动就保持默认） =================
+    // ================= 可调项 =================
     /** 实时数据上报间隔（秒），游戏面板建议 >= 5 */
     private static final int  REPORT_INTERVAL_SEC = 10;
     /** 基础信息上报间隔（分钟） */
@@ -47,8 +42,7 @@ public final class KomariAgent {
     /** 统计哪个挂载点的磁盘（容器内可设 /home/container） */
     private static final String DISK_PATH         = "/";
     /** 打印每次上报的 HTTP 响应（排错时开，正常关闭） */
-    private static final boolean DEBUG            = false;
-    // =============================================================
+    private static final boolean DEBUG            = true;
 
     private static final AtomicBoolean running = new AtomicBoolean(false);
     private static volatile Thread worker = null;
@@ -59,7 +53,7 @@ public final class KomariAgent {
     //  传输：JSON-RPC 2.0 over HTTP POST
     // =========================================================
 
-    /** 发一条 JSON-RPC；失败抛异常，由调用方吞掉。 */
+    /** 发一条 JSON-RPC；失败抛异常，由调用方吞掉并打日志。 */
     private static void rpc(String method, Map<String, Object> params) throws Exception {
         Map<String, Object> env = new LinkedHashMap<>();
         env.put("jsonrpc", "2.0");
@@ -81,13 +75,16 @@ public final class KomariAgent {
         HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
         if (DEBUG) {
             String body = resp.body();
-            if (body != null && body.length() > 300) body = body.substring(0, 300);
-            System.out.println("[komari] " + method + " -> " + resp.statusCode() + " " + body);
+            if (body != null && body.length() > 500) body = body.substring(0, 500) + "...";
+            System.out.println("[komari] " + method + " -> HTTP " + resp.statusCode() + " " + body);
+        }
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new Exception("Komari HTTP " + resp.statusCode() + ": " + resp.body());
         }
     }
 
     // =========================================================
-    //  采集（全部来自 /proc 与 JDK 自带 API）
+    //  采集（全部来自 /proc 与 JDK 自带 API，容器受限时兜底）
     // =========================================================
 
     private static volatile long prevIdle = -1;
@@ -100,13 +97,15 @@ public final class KomariAgent {
         try {
             return Files.readAllLines(Paths.get(path), StandardCharsets.UTF_8);
         } catch (Exception e) {
+            System.out.println("[komari] 读取失败: " + path + " -> " + e.getClass().getSimpleName() + ": " + e.getMessage());
             return new ArrayList<>();
         }
     }
 
     private static Map<String, Long> meminfoBytes() {
         Map<String, Long> info = new LinkedHashMap<>();
-        for (String line : readLines("/proc/meminfo")) {
+        List<String> lines = readLines("/proc/meminfo");
+        for (String line : lines) {
             int i = line.indexOf(':');
             if (i < 0) continue;
             String rest = line.substring(i + 1).trim();
@@ -193,6 +192,7 @@ public final class KomariAgent {
             }
             return n;
         } catch (Exception e) {
+            System.out.println("[komari] 读取 /proc 目录失败: " + e.getMessage());
             return 0;
         }
     }
@@ -254,6 +254,12 @@ public final class KomariAgent {
         long avail = mem.containsKey("MemAvailable")
                 ? nz(mem.get("MemAvailable"))
                 : nz(mem.get("MemFree")) + nz(mem.get("Buffers")) + nz(mem.get("Cached"));
+        // 容器里 /proc/meminfo 读不到时，用 JVM Runtime 兜底
+        if (mTotal == 0) {
+            long jvmMax = Runtime.getRuntime().maxMemory();
+            if (jvmMax > 0) mTotal = jvmMax;
+            avail = jvmMax - Runtime.getRuntime().freeMemory();
+        }
         long sTotal = nz(mem.get("SwapTotal"));
         long sFree = nz(mem.get("SwapFree"));
         long[] d = diskTotalUsed();
@@ -315,10 +321,7 @@ public final class KomariAgent {
         }
     }
 
-    /**
-     * 幂等启动上报线程。host 或 token 为空则跳过。
-     * @return true 表示本次真的启动了
-     */
+    /** 幂等启动上报线程。host 或 token 为空则跳过。 */
     public static boolean start(String host, String tokenValue) {
         if (host == null || host.trim().isEmpty()) return false;
         if (tokenValue == null || tokenValue.trim().isEmpty()) {
