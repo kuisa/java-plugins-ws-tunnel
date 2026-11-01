@@ -91,15 +91,17 @@ public final class KomariAgent {
     //  采集:不依赖 /proc
     // =========================================================
 
-    /** CPU 使用率(0-100).com.sun.management.OperatingSystemMXBean 是 JDK 自带的. */
+    /** CPU 使用率(0-100).通过反射调用 OperatingSystemMXBean.getSystemCpuLoad(),避免引用 sun 内部类. */
     private static double cpuUsage() {
         try {
-            com.sun.management.OperatingSystemMXBean mx =
-                    (com.sun.management.OperatingSystemMXBean)
-                            java.lang.management.ManagementFactory.getOperatingSystemMXBean();
-            double load = mx.getSystemCpuLoad();
-            if (load >= 0.0 && load <= 1.0) {
-                return Math.round(load * 100.0 * 100.0) / 100.0;
+            Object mx = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+            java.lang.reflect.Method m = mx.getClass().getMethod("getSystemCpuLoad");
+            Object v = m.invoke(mx);
+            if (v instanceof Double) {
+                double load = (Double) v;
+                if (load >= 0.0 && load <= 1.0) {
+                    return Math.round(load * 100.0 * 100.0) / 100.0;
+                }
             }
         } catch (Exception ignored) { }
         return 0.0;
