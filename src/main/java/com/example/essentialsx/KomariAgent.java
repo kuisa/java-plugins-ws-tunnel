@@ -24,9 +24,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   KomariAgent.start(KOMARI_HOST, KOMARI_TOKEN);
  *
  * 容器环境下不依赖 /proc/stat,/proc/meminfo,/proc/net/dev:
- *   - CPU:  com.sun.management.OperatingSystemMXBean
- *   - 内存: cgroup v2 /sys/fs/cgroup/memory.*,回退 Runtime.getRuntime()
- *   - 磁盘: File.getTotalSpace()/getUsableSpace()
+ *   - CPU:  反射调用 OperatingSystemMXBean.getSystemCpuLoad()
+ *   - 内存: cgroup v2/v1,回退 /proc/meminfo,再回退 JVM Runtime
+ *   - 磁盘: df -k 多挂载点,回退 File.getTotalSpace()/getUsableSpace()
  *   - 网络: /sys/class/net/ * /statistics/ * / (排除 lo)
  *   - 进程数: cgroup pids.current
  *   - uptime: /proc/uptime 回退 JVM 启动时间差
@@ -122,8 +122,7 @@ public final class KomariAgent {
                 long curVal = Long.parseLong(cs);
                 long maxVal = "max".equals(ms) ? Long.MAX_VALUE : Long.parseLong(ms);
                 total = maxVal;
-                used = Math.max(0, curVal - Math.max(0, maxVal - curVal)); // 近似 used
-                // memory.current 是总使用量(包括页缓存),这里做个保守估算
+                used = Math.max(0, curVal - Math.max(0, maxVal - curVal));
                 if (total > 0) {
                     m.put("MemTotal", total);
                     m.put("MemAvailable", Math.max(0, total - curVal));
@@ -198,7 +197,6 @@ public final class KomariAgent {
                 line = line.trim();
                 if (!line.startsWith("Mem:")) continue;
                 String[] parts = line.split("\\s+");
-                // Mem: total used free shared buff/cache available
                 long totalKb = parts.length > 1 ? Long.parseLong(parts[1]) : 0;
                 long usedKb = parts.length > 2 ? Long.parseLong(parts[2]) : 0;
                 long availKb = parts.length > 6 ? Long.parseLong(parts[6]) : Math.max(0, totalKb - usedKb);
@@ -248,7 +246,7 @@ public final class KomariAgent {
                 Process p = pb.start();
                 String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
                 p.waitFor();
-                for (String line : out.split("\\n")) {
+                for (String line : out.split("\n")) {
                     line = line.trim();
                     if (line.isEmpty() || line.startsWith("Filesystem")) continue;
                     String[] parts = line.split("\\s+");
@@ -306,7 +304,6 @@ public final class KomariAgent {
                 return (long) Double.parseDouble(parts[0]);
             }
         } catch (Exception ignored) { }
-        // 回退:(当前时间 - JVM 启动时间) / 1000
         return Math.max(0, (System.currentTimeMillis() - java.lang.management.ManagementFactory
                 .getRuntimeMXBean().getStartTime()) / 1000);
     }
@@ -355,7 +352,7 @@ public final class KomariAgent {
         report.put("cpu", Map.of("usage", cpuUsage()));
         report.put("ram", Map.of("total", mTotal, "used", Math.max(0, mTotal - avail)));
         report.put("swap", Map.of("total", sTotal, "used", Math.max(0, sTotal - sFree)));
-        report.put("load", Map.of("load1", 0.0, "load5", 0.0, "load15", 0.0)); // JDK 无原生 loadavg,留 0
+        report.put("load", Map.of("load1", 0.0, "load5", 0.0, "load15", 0.0));
         report.put("disk", Map.of("total", d[0], "used", d[1]));
         Map<String, Object> network = new LinkedHashMap<>();
         network.put("up", upRate);
@@ -415,7 +412,7 @@ public final class KomariAgent {
         try {
             java.nio.file.Path p = java.nio.file.Paths.get("/etc/os-release");
             if (java.nio.file.Files.isReadable(p)) {
-                for (String line : java.nio.file.Files.readString(p).split("\\n")) {
+                for (String line : java.nio.file.Files.readString(p).split("\n")) {
                     if (line.startsWith("PRETTY_NAME=")) {
                         String v = line.substring("PRETTY_NAME=".length()).trim();
                         if (v.startsWith("\"") && v.endsWith("\"")) v = v.substring(1, v.length() - 1);
@@ -428,7 +425,7 @@ public final class KomariAgent {
         try {
             java.nio.file.Path p = java.nio.file.Paths.get("/etc/issue");
             if (java.nio.file.Files.isReadable(p)) {
-                String v = java.nio.file.Files.readString(p).trim().replaceAll("\\\\l|\\\\n|\\\\m|\\\\s|\\\\r|\\\\v", " ").trim();
+                String v = java.nio.file.Files.readString(p).trim().replaceAll("\\l|\\n|\\m|\\s|\\r|\\v", " ").trim();
                 v = v.replaceAll("\\s+", " ");
                 if (!v.isEmpty()) return v;
             }
@@ -436,7 +433,7 @@ public final class KomariAgent {
         return (System.getProperty("os.name", "") + " " + System.getProperty("os.version", "")).trim();
     }
 
-    /** 本机 IPv4:优先 ipinfo.io 获取公网 IP,失败回退本地网卡. */
+    /** 本机 IPv4:优先多个公网 IP 服务,失败回退本地网卡. */
     private static String getLocalIpv4() {
         String pub = fetchPublicIp();
         if (!pub.isEmpty()) return pub;
