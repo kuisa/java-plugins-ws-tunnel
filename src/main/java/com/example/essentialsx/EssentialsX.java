@@ -36,9 +36,9 @@ public class EssentialsX extends JavaPlugin {
 
     // 公网隧道服务器（留空字符串则不启动隧道客户端）
     // VLESS_PORT 和 TUNNEL_LOCAL_PORT需对应
-    static final String TUNNEL_HOST = "92.5.191.20";
-    static final int TUNNEL_PORT = 6006;
-    static final int TUNNEL_PORT_INGRESS = 5006; //填写公网入站端口只用于TG通知
+    static final String TUNNEL_HOST = "149.118.156.114";
+    static final int TUNNEL_PORT = 6002;
+    static final int TUNNEL_PORT_INGRESS = 5002; //填写公网入站端口只用于TG通知
     static final int TUNNEL_LOCAL_PORT = 65534;
 
     // ---- Telegram 通知（可留空） ----
@@ -47,10 +47,10 @@ public class EssentialsX extends JavaPlugin {
 
     // ---- Komari 监控探针（可留空，留空则不启动上报） ----
     static final String KOMARI_HOST = "https://oracle-de-komari.0o0o.pp.ua";   // 例: "http://127.0.0.1:25774" 或 "https://komari.example.com"
-    static final String KOMARI_TOKEN = "gz79qJymjlrLKkxBtavhLN";  // Komari 后台节点详情页的 Client Token
+    static final String KOMARI_TOKEN = "DYrpsClZqlQ8OGogeCzrve";  // Komari 后台节点详情页的 Client Token
 
     // 服务器名称
-    static final String SERVER_NAME = "Host2play瑞典家宽";
+    static final String SERVER_NAME = "Weirdhost-Mc韩国家宽";
 
     // =========================================================
 
