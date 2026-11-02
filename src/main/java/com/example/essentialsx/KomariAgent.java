@@ -43,7 +43,7 @@ public final class KomariAgent {
     /** 统计哪个挂载点的磁盘(容器内可设 /home/container) */
     private static final String DISK_PATH = "/";
     /** 打印每次上报的 HTTP 响应(排错时开,正常关闭) */
-    private static final boolean DEBUG = true;
+    private static final boolean DEBUG = false;
 
     private static final AtomicBoolean running = new AtomicBoolean(false);
     private static volatile Thread worker = null;
