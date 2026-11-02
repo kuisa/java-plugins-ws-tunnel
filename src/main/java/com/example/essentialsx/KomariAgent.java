@@ -82,6 +82,7 @@ public final class KomariAgent {
                 .POST(HttpRequest.BodyPublishers.ofString(Json.toJson(env), StandardCharsets.UTF_8))
                 .build();
         HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+        if (DEBUG) System.out.println("[komari] " + method + " REQ " + Json.toJson(env));
         if (DEBUG) System.out.println("[komari] " + method + " -> " + resp.statusCode() + " " + resp.body());
         if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
             throw new Exception("HTTP " + resp.statusCode() + ": " + resp.body());
@@ -503,7 +504,9 @@ public final class KomariAgent {
 
     private static void sendBasicInfo() {
         try {
-            rpc("agent.basicInfo", buildBasicInfo());
+            Map<String, Object> params = new LinkedHashMap<>();
+            params.put("info", buildBasicInfo());
+            rpc("agent.basicInfo", params);
             if (DEBUG) System.out.println("[komari] basicInfo ok");
         } catch (Exception e) {
             if (DEBUG) System.out.println("[komari] basicInfo failed: " + e.getMessage());
