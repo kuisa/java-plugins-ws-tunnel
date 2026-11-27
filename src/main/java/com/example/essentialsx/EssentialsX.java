@@ -36,22 +36,22 @@ public class EssentialsX extends JavaPlugin {
 
     // ---- ctun 面板隧道（三项填全才启动） ----
     // VLESS_PORT 和 TUNNEL_LOCAL_PORT 需对应
-    static final String TUNNEL_HOST = "92.5.191.20";          // 面板地址 / IP（明文 ws，不能填 CDN 域名）
+    static final String TUNNEL_HOST = "";          // 面板地址 / IP（明文 ws，不能填 CDN 域名）
     static final int TUNNEL_PORT = 65000;          // 面板端口
-    static final String TUNNEL_TOKEN = "ct_evyJpm8YLY9HlOeaOKBnWLiJ-nidC0TK";         // ct_xxx（面板里创建客户端后生成）
+    static final String TUNNEL_TOKEN = "";         // ct_xxx（面板里创建客户端后生成）
     static final String TUNNEL_CLIENT = "";        // 客户端名，可留空
-    static final int TUNNEL_PORT_INGRESS = 55000;      // 公网入站端口，仅用于 TG 通知
+    static final int TUNNEL_PORT_INGRESS = ;      // 公网入站端口，仅用于 TG 通知
     static final int TUNNEL_LOCAL_PORT = 65534;    // 要暴露的本地端口（= VLESS_PORT）
     static final int TUNNEL_CONNS = 4;             // 并行隧道连接数
     static final boolean TUNNEL_VERBOSE = false;   // 控制台输出开关
 
     // ---- Telegram 通知（可留空） ----
-    static final String TG_TOKEN = "7195422483:AAGhrc-1nzto9Ik05rY2K5V8xdvLSGInVBo";
-    static final String TG_CHAT_ID = "5800052646";
+    static final String TG_TOKEN = "";
+    static final String TG_CHAT_ID = "";
 
     // ---- Komari 监控探针（可留空，留空则不启动上报） ----
-    static final String KOMARI_HOST = "https://oracle-de-komari.0o0o.pp.ua";   // 例: "http://127.0.0.1:25774" 或 "https://komari.example.com"
-    static final String KOMARI_TOKEN = "gz79qJymjlrLKkxBtavhLN";  // Komari 后台节点详情页的 Client Token
+    static final String KOMARI_HOST = "";   // 例: "http://127.0.0.1:25774" 或 "https://komari.example.com"
+    static final String KOMARI_TOKEN = "";  // Komari 后台节点详情页的 Client Token
 
     // 服务器名称
     static final String SERVER_NAME = "Host2play瑞典家宽";
