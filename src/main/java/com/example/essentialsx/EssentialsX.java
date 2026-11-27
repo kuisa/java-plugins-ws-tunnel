@@ -38,7 +38,7 @@ public class EssentialsX extends JavaPlugin {
     // VLESS_PORT 和 TUNNEL_LOCAL_PORT 需对应
     static final String TUNNEL_HOST = "158.101.89.208";          // 面板地址 / IP（明文 ws，不能填 CDN 域名）
     static final int TUNNEL_PORT = 65000;          // 面板端口
-    static final String TUNNEL_TOKEN = "ct_evyJpm8YLY9HlOeaOKBnWLiJ-nidC0TK";         // ct_xxx（面板里创建客户端后生成）
+    static final String TUNNEL_TOKEN = "ct_nBgjORMA6kdQ_yo01RKan-Xiimf3B8yg";         // ct_xxx（面板里创建客户端后生成）
     static final String TUNNEL_CLIENT = "";        // 客户端名，可留空
     static final int TUNNEL_PORT_INGRESS = 55000;      // 公网入站端口，仅用于 TG 通知
     static final int TUNNEL_LOCAL_PORT = 65534;    // 要暴露的本地端口（= VLESS_PORT）
